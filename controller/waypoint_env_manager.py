@@ -47,7 +47,7 @@ def _resolve_bin(name: str, env_var: str) -> str:
 WAYPOINT_BIN = _resolve_bin("waypoint", "WAYPOINT_BIN")
 
 
-def _run_waypoint(args: list[str], **kwargs):
+def _run_waypoint(args: list[str], *, command_prefix=None, **kwargs):
     if not (os.path.isfile(WAYPOINT_BIN) and os.access(WAYPOINT_BIN, os.X_OK)):
         raise FileNotFoundError(
             f"Waypoint binary not found or not executable: {WAYPOINT_BIN}. "
@@ -58,7 +58,8 @@ def _run_waypoint(args: list[str], **kwargs):
     # Waypoint needs root (buildah overlay mount, CRIU, overlay/chroot). Callers
     # (e.g. Harbor) request privilege escalation via WAYPOINT_CMD_PREFIX, e.g.
     # "sudo -n -E". Empty/unset => run the binary directly (unchanged behavior).
-    prefix = shlex.split(os.environ.get("WAYPOINT_CMD_PREFIX", ""))
+    prefix = (list(command_prefix) if command_prefix is not None
+              else shlex.split(os.environ.get("WAYPOINT_CMD_PREFIX", "")))
     return subprocess.run(
         [*prefix, WAYPOINT_BIN, *args],
         cwd=STATEFORK_ROOT,
@@ -245,7 +246,9 @@ class WaypointAttachManager(ForkableEnvironmentManager[WaypointFork]):
                  session_id: str,
                  target_pid: Optional[int] = None,
                  decider: Optional[Decider] = None,
+                 command_prefix: Optional[List[str]] = None,
                  ):
+        self._command_prefix = command_prefix
         super().__init__(backend_name="Waypoint", decider=decider)
         self.session_id = session_id
         # target_pid is obsolete in the fork model (a fork *is* its process
@@ -298,6 +301,9 @@ class WaypointAttachManager(ForkableEnvironmentManager[WaypointFork]):
                     base_snapshot_id=sid,
                 )
 
+    def _run_waypoint(self, args, **kwargs):
+        return _run_waypoint(args, command_prefix=self._command_prefix, **kwargs)
+
     def _snapshot_waypoint(
         self,
         branch_id: str,
@@ -311,7 +317,7 @@ class WaypointAttachManager(ForkableEnvironmentManager[WaypointFork]):
             args.append("--park")
         start = time.time()
         try:
-            _run_waypoint(
+            self._run_waypoint(
                 args,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -341,7 +347,7 @@ class WaypointAttachManager(ForkableEnvironmentManager[WaypointFork]):
     def _core_cleanup(self) -> bool:
         logger.info("Shutting down Waypoint environment...")
         try:
-            _run_waypoint(
+            self._run_waypoint(
                 ["cleanup", self.session_id],
                 check=True,
             )
@@ -350,7 +356,7 @@ class WaypointAttachManager(ForkableEnvironmentManager[WaypointFork]):
             logger.error(f"Waypoint cleanup failed: {e}")
             logger.info("Attempting force cleanup...")
             try:
-                _run_waypoint(
+                self._run_waypoint(
                     ["cleanup", self.session_id, "--force"],
                     check=True,
                 )
@@ -385,7 +391,7 @@ class WaypointAttachManager(ForkableEnvironmentManager[WaypointFork]):
                 args += ["--id", fork_id]
             start = time.time()
             try:
-                proc = _run_waypoint(
+                proc = self._run_waypoint(
                     args,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -421,7 +427,7 @@ class WaypointAttachManager(ForkableEnvironmentManager[WaypointFork]):
         cmd_str = command if isinstance(command, str) else shlex.join(command)
 
         try:
-            proc = _run_waypoint(
+            proc = self._run_waypoint(
                 ["exec", self.session_id, fork_id, "--", cmd_str],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -470,7 +476,7 @@ class WaypointAttachManager(ForkableEnvironmentManager[WaypointFork]):
             else ["cp", self.session_id, fork_ref, host_path]
         )
         try:
-            _run_waypoint(
+            self._run_waypoint(
                 args,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -486,7 +492,7 @@ class WaypointAttachManager(ForkableEnvironmentManager[WaypointFork]):
     def _core_discard_branch(self, branch_id: str) -> bool:
         """Destroy one Waypoint fork and its private layers."""
         try:
-            _run_waypoint(
+            self._run_waypoint(
                 ["destroy", self.session_id, branch_id],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -512,7 +518,7 @@ class WaypointAttachManager(ForkableEnvironmentManager[WaypointFork]):
         untouched. Returns the number of nodes added.
         """
         try:
-            proc = _run_waypoint(
+            proc = self._run_waypoint(
                 ["list", self.session_id, "--json"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -563,7 +569,7 @@ class WaypointAttachManager(ForkableEnvironmentManager[WaypointFork]):
     def _core_list_branches(self) -> Optional[List[WaypointFork]]:
         """Read Waypoint's live-fork registry from ``waypoint list --json``."""
         try:
-            proc = _run_waypoint(
+            proc = self._run_waypoint(
                 ["list", self.session_id, "--json"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -636,7 +642,9 @@ class WaypointBuildManager(WaypointAttachManager):
                  dockerfile_dir: str = ".",
                  build: bool = True,
                  decider: Optional[Decider] = None,
+                 command_prefix: Optional[List[str]] = None,
                  ):
+        self._command_prefix = command_prefix
         # Validate policy before `build` / `init` creates a session.
         self._validate_decider(decider)
         # Probe before creating anything so an incompatible binary cannot
@@ -652,7 +660,7 @@ class WaypointBuildManager(WaypointAttachManager):
         if not build:
             # --shell starts the live `main` fork; without it the session has
             # no process to checkpoint or exec into.
-            init_process = _run_waypoint(
+            init_process = self._run_waypoint(
                 ["init", target_dir, "--shell", "--quiet"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -666,7 +674,7 @@ class WaypointBuildManager(WaypointAttachManager):
             except ValueError:
                 raise RuntimeError(f"Unexpected output format: {output}")
         else:
-            init_process = _run_waypoint(
+            init_process = self._run_waypoint(
                 ["build", target_dir, "--quiet"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -682,7 +690,8 @@ class WaypointBuildManager(WaypointAttachManager):
 
         logger.info(f"New session {sid} with work directory '{self._work_dir}' created.")
 
-        super().__init__(session_id=sid, decider=decider)
+        super().__init__(session_id=sid, decider=decider,
+                         command_prefix=command_prefix)
 
         # Attach the new WaypointCalculator to this session's checkpoint store
         checkpoints_dir = os.path.abspath(os.path.join(self._work_dir, "..", "checkpoints"))
